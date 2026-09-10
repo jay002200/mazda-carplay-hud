@@ -52,11 +52,13 @@
 
 #include "patch.h"
 #include "hud/hud_send.h"
+#include "chinese_to_pinyin.hpp"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <atomic>
+#include <string>
 
 namespace {
 constexpr uint32_t kMtManeuver      = 0x8059;
@@ -104,6 +106,11 @@ uint32_t g_emit_side   = 0xffffffff;
 int32_t  g_emit_angle  = 0x7fffffff;
 int32_t  g_emit_number = 0x7fffffff;
 char     g_emit_road[256] = {0};
+// Last raw CarPlay road name and its HUD-ready form. Guidance frames can repeat
+// at 2 Hz, so avoid decoding and transliterating an unchanged name each time.
+bool        g_cached_road_valid = false;
+char        g_cached_source_road[256] = {0};
+std::string g_cached_hud_road;
 // [2026-06-13 #3] Set by the HUD-clear path (sender thread) so the next maneuver burst resets our
 // emit-dedup state on the msgrcv thread — else re-starting the SAME route after a nav-off finds the
 // first maneuver == the last-emitted, dedups, and leaves the HUD blank until something changes.
@@ -243,6 +250,80 @@ int select_by_head(uint32_t head)
     return -1;
 }
 
+bool is_chinese_codepoint(uint32_t cp)
+{
+    return (cp >= 0x3400u && cp <= 0x9FFFu) ||
+           (cp >= 0xF900u && cp <= 0xFAFFu);
+}
+
+// Convert the UTF-8 road name to the std::wstring expected by
+// chinese_to_pinyin(). Invalid UTF-8 is left untouched by the caller.
+bool decode_utf8(const char *text, std::wstring &decoded, bool &has_chinese)
+{
+    decoded.clear();
+    has_chinese = false;
+
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(text);
+    while (*p != 0) {
+        uint32_t cp = 0;
+        unsigned int continuation_count = 0;
+        uint32_t minimum = 0;
+
+        if (*p < 0x80u) {
+            cp = *p++;
+        } else if ((*p & 0xE0u) == 0xC0u) {
+            cp = *p++ & 0x1Fu;
+            continuation_count = 1;
+            minimum = 0x80u;
+        } else if ((*p & 0xF0u) == 0xE0u) {
+            cp = *p++ & 0x0Fu;
+            continuation_count = 2;
+            minimum = 0x800u;
+        } else if ((*p & 0xF8u) == 0xF0u) {
+            cp = *p++ & 0x07u;
+            continuation_count = 3;
+            minimum = 0x10000u;
+        } else {
+            return false;
+        }
+
+        for (unsigned int i = 0; i < continuation_count; ++i) {
+            if ((*p & 0xC0u) != 0x80u) return false;
+            cp = (cp << 6) | (*p++ & 0x3Fu);
+        }
+        if ((continuation_count != 0 && cp < minimum) ||
+            cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) {
+            return false;
+        }
+
+        has_chinese = has_chinese || is_chinese_codepoint(cp);
+        decoded.push_back(static_cast<wchar_t>(cp));
+    }
+    return true;
+}
+
+const std::string& road_name_for_hud(const char *road)
+{
+    if (g_cached_road_valid && strcmp(road, g_cached_source_road) == 0) {
+        return g_cached_hud_road;
+    }
+
+    std::wstring decoded;
+    bool has_chinese = false;
+    std::string converted;
+    if (!decode_utf8(road, decoded, has_chinese) || !has_chinese) {
+        converted = road;
+    } else {
+        converted = chinese_to_pinyin(decoded);
+    }
+
+    strncpy(g_cached_source_road, road, sizeof(g_cached_source_road) - 1);
+    g_cached_source_road[sizeof(g_cached_source_road) - 1] = '\0';
+    g_cached_hud_road.swap(converted);
+    g_cached_road_valid = true;
+    return g_cached_hud_road;
+}
+
 // [BUILD-19] Latch + emit the chosen buffered maneuver (sel = a g_buf index from select_by_head).
 // Selection is decided by the caller from the guidance maneuverList head; this only paints + dedups.
 void emit_selection(int sel)
@@ -255,12 +336,13 @@ void emit_selection(int sel)
     // the maneuver DESC ("Rẽ trái"/"Rẽ phải"/"Vòng ngược lại") so the strip shows the turn text
     // instead of going blank (we removed the old "borrow the next maneuver's road" hack).
     const char *road = im.road[0] ? im.road : im.desc;
+    const std::string &hud_road = road_name_for_hud(road);
 
     g_disp_event  = im.mv.event;
     g_disp_side   = im.mv.side;
     g_disp_angle  = im.mv.angle;
     g_disp_number = im.mv.number;
-    strncpy(g_disp_road, road, sizeof(g_disp_road) - 1);
+    strncpy(g_disp_road, hud_road.c_str(), sizeof(g_disp_road) - 1);
     g_disp_road[sizeof(g_disp_road) - 1] = '\0';
 
     LOGD("nav PICK sel=%d/%d idx=%u type=%u vi=%u ev=%u side=%u ang=%d num=%d road=\"%s\"",
